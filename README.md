@@ -156,13 +156,6 @@ exposed because the hatching needs them and so might you.
 pen. Named `hl` and not `highlight` so Typst's own flat-rectangle
 `#highlight` stays reachable.
 
-## Where it comes from
-
-Extracted from `mudhakkira`, a package of lesson-preparation sheets for
-Algerian teachers, where these primitives draw the forms. They were written without dependencies on
-purpose: a package whose job is to print a one-page form should not make
-its users download a binary.
-
 ## Licence
 
 MIT.
