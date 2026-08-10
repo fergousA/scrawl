@@ -125,6 +125,44 @@
 ///     `weight-scale` handles that from the caller's stroke width;
 ///   * below 0.9 pt only ONE pass is drawn, because doubling a thin rule
 ///     merely doubles the ink and it reads as bold.
+/// The wobble itself, as DATA: contours in, displaced contours out.
+///
+/// Pulled out of `rough` so the hatching can reuse it. It returns point
+/// lists rather than drawing anything, which is what lets a caller pour
+/// several wobbled paths into a single `curve`.
+///
+/// Each path draws from its OWN stream (`seed + i * 977`), so two passes
+/// over the same contour do not land on top of each other — that offset is
+/// exactly what reads as a pencil going over a line twice.
+#let jitter(paths, seed: 1, amp: 0.06) = range(paths.len()).map(i => {
+  let pts = paths.at(i)
+  let r = randoms(seed + i * 977, pts.len() * 2 + 2)
+  range(pts.len()).map(k => {
+    let p = pts.at(k)
+    (p.at(0) + (r.at(k * 2) - 0.5) * amp,
+     p.at(1) + (r.at(k * 2 + 1) - 0.5) * amp)
+  })
+})
+
+/// The amplitude of the wobble for a contour, in centimetres.
+///
+/// Split out with `jitter` so hatching lines inside a shape shake by the
+/// SAME amount as its outline: computing it per hatch segment would let a
+/// short segment near a corner wobble harder than the long one across the
+/// middle, and the fill would look sorted by length.
+#let rough-amp(pts, roughness: 1.0, weight: 1pt, damping: true) = {
+  let w = weight / 1pt
+  let xs = pts.map(q => q.at(0))
+  let ys = pts.map(q => q.at(1))
+  let dx = calc.max(..xs) - calc.min(..xs)
+  let dy = calc.max(..ys) - calc.min(..ys)
+  let span = calc.max(0.001, calc.sqrt(dx * dx + dy * dy))
+  let damp = if damping {
+    calc.max(0.42, calc.min(1.0, calc.sqrt(3.0 / calc.max(1.0, span))))
+  } else { 1.0 }
+  0.06 * roughness * calc.min(1.0, 0.28 + 0.45 * w) * damp
+}
+
 #let rough(contour, flip: 0cm, seed: 1, roughness: 1.0, closed: true,
            weight: 1pt, damping: true, step: 0.42, ..style) = {
   let pts = resample(contour, step: step, closed: closed)
@@ -141,11 +179,6 @@
   // `roughness: 2` its outline shook several times harder than the table
   // beside it, which is the one thing a "same style throughout" mode must
   // not do.
-  let xs = pts.map(q => q.at(0))
-  let ys = pts.map(q => q.at(1))
-  let dx = calc.max(..xs) - calc.min(..xs)
-  let dy = calc.max(..ys) - calc.min(..ys)
-  let span = calc.max(0.001, calc.sqrt(dx * dx + dy * dy))
   // Damped by the SQUARE ROOT of the length, with a floor. A plain 1/span
   // (my first go) left a 18 cm table rule wobbling by 0.06 mm — invisible,
   // so the sheet looked ruled rather than drawn. Measured: 0.18 mm on a
@@ -156,22 +189,84 @@
   // a big loose sketch wants the wobble to stay proportional. It was baked
   // in when this only had to serve lesson sheets; as a package it has to be
   // a choice.
-  let damp = if damping {
-    calc.max(0.42, calc.min(1.0, calc.sqrt(3.0 / calc.max(1.0, span))))
-  } else { 1.0 }
-  let amp = 0.06 * roughness * calc.min(1.0, 0.28 + 0.45 * w) * damp
+  let amp = rough-amp(pts, roughness: roughness, weight: weight,
+    damping: damping)
   let passes = if w < 0.9 { 1 } else { 2 }
-  let out = ()
-  for pass in range(passes) {
-    let r = randoms(seed + pass * 977, n * 2 + 2)
-    out.push(range(n).map(i => {
-      let p = pts.at(i)
-      (p.at(0) + (r.at(i * 2) - 0.5) * amp,
-       p.at(1) + (r.at(i * 2 + 1) - 0.5) * amp)
-    }))
-  }
+  let out = jitter(range(passes).map(_ => pts), seed: seed, amp: amp)
   lines(out, flip: flip, closed: closed, fill: none, ..style)
 }
+
+// ---------------------------------------------------------------------------
+//  Hatching
+// ---------------------------------------------------------------------------
+
+/// Hatch lines filling a set of contours, as a list of segments.
+///
+/// A scanline sweep: rotate the contours so the hatch direction is
+/// horizontal, cut them with evenly spaced lines, pair the crossings, rotate
+/// the pieces back. Pairing the crossings IS the even-odd rule, so a concave
+/// shape hatches correctly and a second contour punches a hole — the pieces
+/// simply come out in two spans instead of one.
+///
+/// Takes either one contour or a list of them. A list is treated as ONE
+/// region, which is what makes a ring hatch as a ring.
+///
+/// The `<= y` / `> y` asymmetry on the crossing test is deliberate: a vertex
+/// sitting exactly on a scanline must count once, not twice, or the spans
+/// pair up shifted by one and the fill comes out inverted from that line
+/// down. An edge parallel to the sweep contributes nothing, which is right.
+#let hatch-pts(contours, angle: 45deg, gap: 0.25, inset: 0.0) = {
+  let cs = if contours.len() == 0 { return () }
+    else if type(contours.first().first()) == array { contours }
+    else { (contours,) }
+  let c = calc.cos(-angle)
+  let s = calc.sin(-angle)
+  let rot(p) = (p.at(0) * c - p.at(1) * s, p.at(0) * s + p.at(1) * c)
+  let unrot(p) = (p.at(0) * c + p.at(1) * s, -p.at(0) * s + p.at(1) * c)
+  let qs = cs.map(ct => ct.map(rot))
+  let ys = qs.map(q => q.map(p => p.at(1))).flatten()
+  if ys.len() == 0 { return () }
+  let y0 = calc.min(..ys)
+  let y1 = calc.max(..ys)
+  let g = calc.max(0.02, gap)
+  let n = calc.min(400, int((y1 - y0) / g))
+  let out = ()
+  for i in range(1, n + 1) {
+    let y = y0 + i * g
+    if y >= y1 { break }
+    let xs = ()
+    for q in qs {
+      for j in range(q.len()) {
+        let a = q.at(j)
+        let b = q.at(calc.rem(j + 1, q.len()))
+        if (a.at(1) <= y and b.at(1) > y) or (b.at(1) <= y and a.at(1) > y) {
+          let t = (y - a.at(1)) / (b.at(1) - a.at(1))
+          xs.push(a.at(0) + t * (b.at(0) - a.at(0)))
+        }
+      }
+    }
+    xs = xs.sorted()
+    for k in range(int(xs.len() / 2)) {
+      let xa = xs.at(2 * k) + inset
+      let xb = xs.at(2 * k + 1) - inset
+      if xb - xa > 0.03 { out.push((unrot((xa, y)), unrot((xb, y)))) }
+    }
+  }
+  out
+}
+
+/// A hatched fill, to hand to `fill:` where a colour would go.
+///
+/// `shape(pts, fill: hatching(blue))` rather than a pile of `hatch-angle`,
+/// `hatch-gap`, `hatch-weight` arguments next to `fill`: the hatching IS the
+/// fill, and describing it as one value keeps the two from contradicting
+/// each other — there is no way to ask for a red fill hatched at a gap of
+/// zero, because there is only one thing to say.
+#let hatching(paint, angle: 45deg, gap: 0.25, weight: 0.6pt, cross: false,
+              backdrop: none) = (
+  scrawl-hatch: true, paint: paint, angle: angle, gap: gap,
+  weight: weight, cross: cross, backdrop: backdrop,
+)
 
 /// Draw a contour: fill it, outline it, hand-drawn or ruled.
 ///
@@ -187,8 +282,37 @@
   // "outline this filled shape" has to mean. The curves already carry
   // absolute coordinates, so no offset is needed.
   let out = ()
-  if fill != none {
+  let hatched = type(fill) == dictionary and fill.at("scrawl-hatch",
+    default: false)
+  if fill != none and not hatched {
     out.push(place(top + left, region((pts,), flip: flip, fill: fill)))
+  }
+  if hatched {
+    if fill.backdrop != none {
+      out.push(place(top + left,
+        region((pts,), flip: flip, fill: fill.backdrop)))
+    }
+    let angles = if fill.cross { (fill.angle, fill.angle + 90deg) }
+                 else { (fill.angle,) }
+    // The hatching wobbles by the amplitude of the SHAPE, not of each
+    // segment: see `rough-amp`. A short segment near a corner would
+    // otherwise shake harder than the long one across the middle, and the
+    // fill would look sorted by length.
+    let amp = rough-amp(pts, roughness: roughness, weight: fill.weight,
+      damping: damping)
+    let segs = ()
+    for (k, a) in angles.enumerate() {
+      let raw = hatch-pts(pts, angle: a, gap: fill.gap)
+      // A hatch line is TWO points, so it can only wobble at its ends and
+      // comes out straight — the same reason a four-point rectangle cannot
+      // look hand-drawn. Resampling it first is what gives it vertices.
+      let rs = raw.map(sg => resample(sg, step: 0.5, closed: false))
+      segs += if hand == none { rs } else {
+        jitter(rs, seed: seed + 401 + k * 131, amp: amp * 0.8)
+      }
+    }
+    out.push(place(top + left, lines(segs, flip: flip, closed: false,
+      stroke: (paint: fill.paint, thickness: fill.weight, cap: "round"))))
   }
   if paint != none and weight != 0pt {
     let st = (paint: paint, thickness: weight, join: "round")
@@ -330,27 +454,59 @@
           place(anchor, box(width: m.width, body))))
     }
   }
-  // Une flèche : le trait, puis une pointe pleine orientée par le segment.
+  // Une flèche : le trait, puis une pointe pleine orientée par la fin du
+  // trait — pas par la corde `from → to`, sinon une flèche courbe pointe à
+  // côté de sa propre trajectoire.
   let _arrow(from, to, ..a) = {
     let n = a.named()
-    let head = n.at("head", default: 0.32)
     let paint = n.at("paint", default: black)
+    let bend = n.at("bend", default: 0.0)
+    let w = n.at("weight", default: 1pt)
+    let sd = n.at("seed", default: seed)
     let (dx, dy) = (to.at(0) - from.at(0), to.at(1) - from.at(1))
     let d = calc.max(1e-6, calc.sqrt(dx * dx + dy * dy))
-    let (ux, uy) = (dx / d, dy / d)
+    // LA POINTE NE PEUT PAS ÊTRE PLUS LONGUE QUE SA FLÈCHE.
+    //
+    // 0,32 cm convient pour relier deux coins d'un dessin ; entre deux
+    // boîtes espacées de 4 mm, il ne restait qu'un triangle et deux pixels
+    // de trait — le schéma de la vitrine avait exactement ce défaut. La
+    // pointe est donc plafonnée à 55 % de la longueur.
+    let head = calc.min(n.at("head", default: 0.32), d * 0.55)
+    // LA COURBURE EST RELATIVE À LA LONGUEUR. `bend: 0.3` donne le même arc
+    // qu'on relie deux boîtes voisines ou deux coins de la page ; en valeur
+    // absolue il faudrait la régler à chaque appel.
+    let ctrl = (
+      (from.at(0) + to.at(0)) / 2 - dy * bend,
+      (from.at(1) + to.at(1)) / 2 + dx * bend,
+    )
+    // Un Bézier quadratique échantillonné : `rough` veut des points, et le
+    // trait doit de toute façon trembler le long de la courbe.
+    let steps = if bend == 0 { 1 } else { 24 }
+    let path = range(steps + 1).map(i => {
+      let t = i / steps
+      let u = 1 - t
+      (u * u * from.at(0) + 2 * u * t * ctrl.at(0) + t * t * to.at(0),
+       u * u * from.at(1) + 2 * u * t * ctrl.at(1) + t * t * to.at(1))
+    })
+    // La direction d'arrivée se lit sur le dernier segment tracé.
+    let prev = path.at(path.len() - 2)
+    let (ex, ey) = (to.at(0) - prev.at(0), to.at(1) - prev.at(1))
+    let el = calc.max(1e-6, calc.sqrt(ex * ex + ey * ey))
+    let (ux, uy) = (ex / el, ey / el)
     // Le trait s'arrête au CREUX de la pointe, pas à son extrémité : mené
     // jusqu'au bout, il dépasse de part et d'autre du triangle.
     let base = (to.at(0) - ux * head * 0.9, to.at(1) - uy * head * 0.9)
-    _shape((from, base), paint: paint,
-      weight: n.at("weight", default: 1pt), closed: false,
-      seed: n.at("seed", default: seed))
+    // Le dernier point du trait est ramené sur ce creux : couper le dernier
+    // échantillon laisserait un blanc entre le trait et la pointe sur une
+    // courbe très cintrée.
+    let body-path = path.slice(0, path.len() - 1) + (base,)
+    _shape(body-path, paint: paint, weight: w, closed: false, seed: sd)
     let (px, py) = (-uy * head * 0.42, ux * head * 0.42)
     _shape((
       (base.at(0) + px, base.at(1) + py),
       to,
       (base.at(0) - px, base.at(1) - py),
-    ), paint: paint, fill: paint, weight: n.at("weight", default: 1pt),
-      seed: n.at("seed", default: seed) + 3)
+    ), paint: paint, fill: paint, weight: w, seed: sd + 3)
   }
   let _region(cs, ..a) = region(cs, flip: flip, ..a)
   let _rough(c, ..a) = {
